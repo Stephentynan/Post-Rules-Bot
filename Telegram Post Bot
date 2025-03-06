@@ -1,0 +1,438 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler, CallbackQueryHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
+import logging
+import os
+import json
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Bot Token from environment variable for security
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    # Fallback for testing, but prefer using environment variables
+    BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+    logger.warning("Using hardcoded token. For production, use environment variables!")
+
+# File to save bot settings
+SETTINGS_FILE = "bot_settings.json"
+
+# Scheduler
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# Dictionary to store settings for multiple groups and topics
+bot_settings = {}
+
+# Define conversation states
+MAIN_MENU, SET_MESSAGE, SET_INTERVAL, SET_TOPIC = range(4)
+
+def save_settings():
+    """Save bot settings to a file."""
+    try:
+        # Convert complex keys to strings for JSON serialization
+        serializable_settings = {}
+        for chat_id in bot_settings:
+            serializable_settings[str(chat_id)] = {}
+            for topic_id in bot_settings[chat_id]:
+                serializable_settings[str(chat_id)][str(topic_id)] = bot_settings[chat_id][topic_id]
+        
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(serializable_settings, f)
+        logger.info(f"Settings saved to {SETTINGS_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save settings: {e}")
+
+def load_settings():
+    """Load bot settings from file."""
+    global bot_settings
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r') as f:
+                serialized_settings = json.load(f)
+                
+            # Convert string keys back to integers
+            bot_settings = {}
+            for chat_id_str in serialized_settings:
+                chat_id = int(chat_id_str)
+                bot_settings[chat_id] = {}
+                for topic_id_str in serialized_settings[chat_id_str]:
+                    topic_id = int(topic_id_str) if topic_id_str != "None" else None
+                    bot_settings[chat_id][topic_id] = serialized_settings[chat_id_str][topic_id_str]
+            
+            logger.info(f"Settings loaded from {SETTINGS_FILE}")
+            
+            # Restore scheduled jobs
+            for chat_id in bot_settings:
+                for topic_id in bot_settings[chat_id]:
+                    settings = bot_settings[chat_id][topic_id]
+                    if settings.get("active", False):
+                        job_id = f"{chat_id}_{topic_id}"
+                        scheduler.add_job(
+                            schedule_message,
+                            "interval",
+                            minutes=settings["interval"],
+                            kwargs={"chat_id": chat_id, "topic_id": topic_id},
+                            id=job_id,
+                            replace_existing=True,
+                        )
+                        logger.info(f"Restored job: {job_id}")
+    except Exception as e:
+        logger.error(f"Failed to load settings: {e}")
+        bot_settings = {}
+
+def get_chat_settings(chat_id, topic_id):
+    """Retrieve or initialize settings for a specific chat-topic pair."""
+    if chat_id not in bot_settings:
+        bot_settings[chat_id] = {}
+
+    if topic_id not in bot_settings[chat_id]:
+        bot_settings[chat_id][topic_id] = {
+            "text": "No message set.",
+            "interval": 5,
+            "hide_menu": False,
+            "active": False,
+            "last_sent": None
+        }
+
+    return bot_settings[chat_id][topic_id]
+
+async def show_menu(update: Update, context: CallbackContext, prompt_text=""):
+    """Show menu dynamically for the specific group and topic."""
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, 'message_thread_id', None) if update.message else None
+
+    settings = get_chat_settings(chat_id, topic_id)
+
+    if settings.get("hide_menu", False):
+        return
+
+    # Status indicator
+    status = "🟢 Active" if settings.get("active", False) else "🔴 Inactive"
+    last_sent = settings.get("last_sent", "Never")
+    
+    menu_text = (f"📢 *Group Topic Bot Menu:*\n\n"
+                 f"📝 *Scheduled Message:* {settings['text']}\n"
+                 f"⏳ *Interval:* {settings['interval']} minutes\n"
+                 f"📊 *Status:* {status}\n"
+                 f"🕒 *Last Sent:* {last_sent}\n\n"
+                 f"Choose an option below:\n\n"
+                 f"{prompt_text}")
+
+    keyboard = [
+        [InlineKeyboardButton("📝 Set Topic", callback_data="set_topic")],
+        [InlineKeyboardButton("✍️ Set Message", callback_data="set_message")],
+        [InlineKeyboardButton("⏳ Set Interval", callback_data="set_interval")],
+    ]
+    
+    # Add start/stop button based on current status
+    if settings.get("active", False):
+        keyboard.append([InlineKeyboardButton("🛑 Stop Messages", callback_data="stop_messages")])
+    else:
+        keyboard.append([InlineKeyboardButton("▶️ Start Messages", callback_data="start_messages")])
+        
+    keyboard.extend([
+        [InlineKeyboardButton("🙈 Hide Menu", callback_data="hide_menu")],
+        [InlineKeyboardButton("❌ Quit", callback_data="quit")],
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    old_message_id = context.user_data.get("menu_message_id")
+
+    if old_message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_message_id,
+                text=menu_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as e:
+            logger.warning(f"Could not edit existing menu message: {e}")
+
+    # Send a new message if we can't edit
+    if hasattr(update, 'message') and update.message:
+        sent_message = await update.message.reply_text(menu_text,
+                                                   parse_mode="Markdown",
+                                                   reply_markup=reply_markup)
+        context.user_data["menu_message_id"] = sent_message.message_id
+    elif hasattr(update, 'callback_query') and update.callback_query:
+        sent_message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+        context.user_data["menu_message_id"] = sent_message.message_id
+
+async def start(update: Update, context: CallbackContext):
+    """Start the bot and show the menu."""
+    await show_menu(update, context, "Welcome to the Topic Bot! Select an option to configure.")
+    return MAIN_MENU
+
+async def status(update: Update, context: CallbackContext):
+    """Show the current status of scheduled messages."""
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, 'message_thread_id', None)
+    
+    settings = get_chat_settings(chat_id, topic_id)
+    
+    status_text = "🔴 Inactive"
+    if settings.get("active", False):
+        status_text = "🟢 Active"
+        
+    await update.message.reply_text(
+        f"📊 *Current Status*\n\n"
+        f"*Message:* {settings['text']}\n"
+        f"*Interval:* {settings['interval']} minutes\n"
+        f"*Status:* {status_text}\n"
+        f"*Last Sent:* {settings.get('last_sent', 'Never')}\n\n"
+        f"Use /start to configure settings.",
+        parse_mode="Markdown"
+    )
+    
+    return ConversationHandler.END
+
+async def menu_selection(update: Update, context: CallbackContext):
+    """Handle button clicks from the menu."""
+    query = update.callback_query
+    await query.answer()  # Acknowledge the button click
+    
+    choice = query.data
+    chat_id = query.message.chat_id
+    topic_id = getattr(query.message, 'message_thread_id', None)
+
+    settings = get_chat_settings(chat_id, topic_id)
+
+    if choice == "set_topic":
+        await query.edit_message_text(
+            text=f"📌 *Reply to a message in the topic you want to set.*\n\n"
+                 f"Current settings:\n"
+                 f"*Message:* {settings['text']}\n"
+                 f"*Interval:* {settings['interval']} minutes",
+            parse_mode="Markdown"
+        )
+        return SET_TOPIC
+
+    elif choice == "set_message":
+        await query.edit_message_text(
+            text="✍️ *Type the message you want to schedule:*\n\n"
+                 f"Current message: {settings['text']}",
+            parse_mode="Markdown"
+        )
+        return SET_MESSAGE
+
+    elif choice == "set_interval":
+        await query.edit_message_text(
+            text="⏳ *Enter the interval in minutes:*\n\n"
+                 f"Current interval: {settings['interval']} minutes",
+            parse_mode="Markdown"
+        )
+        return SET_INTERVAL
+        
+    elif choice == "start_messages":
+        settings["active"] = True
+        
+        # Schedule the job
+        job_id = f"{chat_id}_{topic_id}"
+        scheduler.add_job(
+            schedule_message,
+            "interval",
+            minutes=settings["interval"],
+            kwargs={"chat_id": chat_id, "topic_id": topic_id},
+            id=job_id,
+            replace_existing=True,
+        )
+        
+        logger.info(f"Started job: {job_id}")
+        save_settings()
+        
+        # Show updated menu
+        update.callback_query = query  # Ensure update has the callback_query set
+        await show_menu(update, context, "✅ *Scheduled messages started!*")
+        return MAIN_MENU
+        
+    elif choice == "stop_messages":
+        settings["active"] = False
+        
+        # Remove the job
+        job_id = f"{chat_id}_{topic_id}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            
+        logger.info(f"Stopped job: {job_id}")
+        save_settings()
+        
+        # Show updated menu
+        update.callback_query = query  # Ensure update has the callback_query set
+        await show_menu(update, context, "🛑 *Scheduled messages stopped!*")
+        return MAIN_MENU
+
+    elif choice == "hide_menu":
+        settings["hide_menu"] = True
+        save_settings()
+        await query.message.edit_text("✅ Menu hidden! Use /start to show it again.")
+        return ConversationHandler.END
+
+    elif choice == "quit":
+        await query.message.edit_text("👋 Exiting setup. Use /start to configure again.")
+        return ConversationHandler.END
+
+async def set_topic(update: Update, context: CallbackContext):
+    """Set the topic ID and update the menu."""
+    chat_id = update.effective_chat.id
+    message = update.message
+
+    if not message.reply_to_message:
+        await message.reply_text("⚠️ Please reply to a message in the topic to set it.")
+        await show_menu(update, context, "⚠️ *Please reply to a message in the topic to set it.*")
+        return MAIN_MENU
+
+    topic_id = message.reply_to_message.message_thread_id
+    get_chat_settings(chat_id, topic_id)  # Ensure settings exist
+    save_settings()
+
+    await show_menu(update, context, "✅ *Topic set! Messages will be posted in this topic.*")
+    return MAIN_MENU
+
+async def set_message(update: Update, context: CallbackContext):
+    """Set the scheduled message and update the menu."""
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, 'message_thread_id', None)
+    settings = get_chat_settings(chat_id, topic_id)
+
+    settings["text"] = update.message.text
+    save_settings()
+
+    await show_menu(update, context, f"✅ *Scheduled message set:* {update.message.text}")
+    return MAIN_MENU
+
+async def set_interval(update: Update, context: CallbackContext):
+    """Set the interval and update the menu message."""
+    chat_id = update.effective_chat.id
+    topic_id = getattr(update.message, 'message_thread_id', None)
+    settings = get_chat_settings(chat_id, topic_id)
+
+    if not update.message.text.isdigit():
+        await update.message.reply_text("❌ Please enter a valid number.")
+        await show_menu(update, context, "❌ *Please enter a valid number.*")
+        return SET_INTERVAL
+
+    interval = int(update.message.text)
+    if interval < 1:
+        await update.message.reply_text("❌ Interval must be at least 1 minute.")
+        await show_menu(update, context, "❌ *Interval must be at least 1 minute.*")
+        return SET_INTERVAL
+        
+    settings["interval"] = interval
+
+    # Update job if active
+    if settings.get("active", False):
+        job_id = f"{chat_id}_{topic_id}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            
+        scheduler.add_job(
+            schedule_message,
+            "interval",
+            minutes=interval,
+            kwargs={"chat_id": chat_id, "topic_id": topic_id},
+            id=job_id,
+            replace_existing=True,
+        )
+        logger.info(f"Updated job interval for {job_id} to {interval} minutes")
+    
+    save_settings()
+    await show_menu(update, context, f"✅ *Interval set to {interval} minutes.*")
+    return MAIN_MENU
+
+def schedule_message(chat_id, topic_id):
+    """Schedule messages with proper asyncio handling."""
+    try:
+        settings = get_chat_settings(chat_id, topic_id)
+        message_text = settings["text"]
+        
+        # Only proceed if active
+        if not settings.get("active", False):
+            logger.info(f"Job {chat_id}_{topic_id} is inactive, skipping.")
+            return
+        
+        # Run in the event loop
+        asyncio.run(send_scheduled_message(chat_id, topic_id, message_text))
+        
+        # Update last sent time
+        settings["last_sent"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_settings()
+        
+    except Exception as e:
+        logger.error(f"Error in schedule_message: {e}")
+
+async def send_scheduled_message(chat_id, topic_id, text):
+    """Send the scheduled message to the respective chat topic."""
+    from telegram import Bot
+    
+    try:
+        bot = Bot(token=BOT_TOKEN)
+        
+        if topic_id:
+            await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=topic_id,
+                text=text
+            )
+            logger.info(f"Sent scheduled message to chat {chat_id}, topic {topic_id}")
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ No topic set! Use the menu to set a topic."
+            )
+            logger.warning(f"No topic set for chat {chat_id}")
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+
+def main():
+    """Start the bot."""
+    # Load saved settings
+    load_settings()
+    
+    # Initialize the application
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [CallbackQueryHandler(menu_selection)],
+            SET_TOPIC: [MessageHandler(filters.REPLY, set_topic)],
+            SET_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_message)],
+            SET_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
+    # Add handlers
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("status", status))
+    
+    # Start polling
+    logger.info("Bot starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"Critical error: {e}")
+    finally:
+        scheduler.shutdown()
+        logger.info("Bot shutdown complete")
